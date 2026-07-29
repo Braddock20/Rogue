@@ -30,6 +30,7 @@ const pino = require('pino');
 
 const config = require('./config');
 const { generateReply } = require('./gemini');
+const { restoreFromEnv, printSessionBlob } = require('./session-env');
 
 // -------- sanity checks ---------------------------------------------------
 
@@ -46,6 +47,8 @@ if (!config.gemini.apiKey) {
 const lastReplyAt = new Map();
 /** Map<jid, Array<{role, text, sender, ts}>> — rolling per-chat history */
 const chatHistory = new Map();
+/** Set<string> — recently seen message IDs, to dedupe re-delivered events */
+const seenMsgIds = new Set();
 
 function pushHistory(jid, role, text, sender) {
   const list = chatHistory.get(jid) || [];
@@ -142,9 +145,13 @@ function extractText(msg) {
 // -------- main ------------------------------------------------------------
 
 async function start() {
+  // Restore a previously saved session from the WA_SESSION env var, if set,
+  // so we don't need to re-pair after every Render restart/redeploy.
+  restoreFromEnv();
+
   // auth_info_baileys holds the signed-in credentials between restarts.
-  // On Render, this is ephemeral storage — Render will keep the worker
-  // running so the auth stays, but the FIRST deploy still needs pairing.
+  // On Render, this is ephemeral storage — see session-env.js for how we
+  // work around that with WA_SESSION.
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
   const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -175,6 +182,10 @@ async function start() {
 
     if (connection === 'open') {
       console.log('[wa] ✅ connected — bot is live.');
+      // Print a fresh session blob so it can be copied into Render's
+      // WA_SESSION env var. Do this every time we connect so the saved
+      // session stays reasonably up to date.
+      printSessionBlob();
     }
 
     if (connection === 'close') {
@@ -229,6 +240,16 @@ async function handleIncoming(sock, msg) {
   // Skip outgoing / non-message events
   if (!msg.message || msg.key.fromMe) return;
 
+  // Dedupe — WhatsApp sometimes redelivers the same event
+  const msgId = msg.key.id;
+  if (msgId) {
+    if (seenMsgIds.has(msgId)) return;
+    seenMsgIds.add(msgId);
+    if (seenMsgIds.size > 500) {
+      seenMsgIds.delete(seenMsgIds.values().next().value);
+    }
+  }
+
   const chatJid = msg.key.remoteJid;
   const text = extractText(msg);
   if (!text || !text.trim()) return;
@@ -244,6 +265,9 @@ async function handleIncoming(sock, msg) {
     console.log(`[skip] ${chatJid} -> cooldown (${config.cooldownMs / 1000}s)`);
     return;
   }
+
+  // Lock the cooldown now, before the slow Gemini call, to avoid races
+  markReplied(chatJid);
 
   // Look up the chat name (group subject / contact push name)
   let chatName = '';
@@ -301,7 +325,6 @@ async function handleIncoming(sock, msg) {
   }
 
   pushHistory(chatJid, 'model', reply);
-  markReplied(chatJid);
   console.log(`[out] ${chatName || chatJid}: ${reply.slice(0, 80)}`);
 }
 
