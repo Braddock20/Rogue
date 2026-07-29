@@ -307,6 +307,13 @@ async function handleIncoming(sock, msg) {
 
 // -------- boot ------------------------------------------------------------
 
+const http = require('http');
+http
+  .createServer((req, res) => res.end('WhatsApp bot is running'))
+  .listen(process.env.PORT || 3000, '0.0.0.0', () => {
+    console.log(`[http] keepalive server on port ${process.env.PORT || 3000}`);
+  });
+
 start().catch((err) => {
   console.error('[fatal]', err);
   process.exit(1);
